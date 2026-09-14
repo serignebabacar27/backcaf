@@ -118,10 +118,79 @@ function cleanInvoice(invoice) {
   };
 }
 
+function cleanClient(client) {
+  const { _id, ownerId, createdAt, updatedAt, ...rest } = client;
+  return {
+    ...rest,
+    id: _id.toString(),
+    ownerId: ownerId?.toString?.() || ownerId,
+    createdAt,
+    updatedAt
+  };
+}
+
+function invoiceNumberKey(number) {
+  return String(number || "").trim();
+}
+
+async function highestInvoiceNumber() {
+  const invoices = await db.collection("invoices").find({}, { projection: { number: 1 } }).toArray();
+  return invoices.reduce((max, invoice) => {
+    const numeric = String(invoice.number || "").match(/\d+/g)?.join("") || "0";
+    return Math.max(max, Number(numeric));
+  }, 0);
+}
+
+async function nextInvoiceNumber() {
+  const counterId = "invoiceNumber";
+  const highest = await highestInvoiceNumber();
+  const counter = await db.collection("counters").findOne({ _id: counterId });
+
+  if (!counter) {
+    await db.collection("counters").insertOne({ _id: counterId, value: highest }).catch((error) => {
+      if (error?.code !== 11000) throw error;
+    });
+  } else if (Number(counter.value || 0) < highest) {
+    await db.collection("counters").updateOne({ _id: counterId }, { $set: { value: highest } });
+  }
+
+  const result = await db.collection("counters").findOneAndUpdate(
+    { _id: counterId },
+    { $inc: { value: 1 } },
+    { returnDocument: "after" }
+  );
+  const next = Number(result?.value || highest + 1);
+  return String(next).padStart(3, "0");
+}
+
+async function repairDuplicateInvoiceNumbers() {
+  const invoices = await db.collection("invoices").find({}, { projection: { number: 1, createdAt: 1 } })
+    .sort({ createdAt: 1, _id: 1 })
+    .toArray();
+  const used = new Set();
+  let highest = await highestInvoiceNumber();
+
+  for (const invoice of invoices) {
+    const number = invoiceNumberKey(invoice.number);
+    if (number && !used.has(number)) {
+      used.add(number);
+      continue;
+    }
+
+    highest += 1;
+    const next = String(highest).padStart(3, "0");
+    used.add(next);
+    await db.collection("invoices").updateOne({ _id: invoice._id }, { $set: { number: next, updatedAt: new Date() } });
+  }
+}
+
 async function ensureIndexesAndAdmin() {
   await db.collection("users").createIndex({ email: 1 }, { unique: true });
   await db.collection("invoices").createIndex({ ownerId: 1, updatedAt: -1 });
   await db.collection("invoices").createIndex({ number: 1 });
+  await db.collection("clients").createIndex({ ownerId: 1, name: 1 });
+  await db.collection("counters").createIndex({ _id: 1 }, { unique: true });
+  await repairDuplicateInvoiceNumbers();
 
   const adminEmail = process.env.ADMIN_EMAIL || "admin@zmtrans.sn";
   const exists = await db.collection("users").findOne({ email: adminEmail });
@@ -225,6 +294,112 @@ app.get("/api/users/:id/invoices", authRequired, adminRequired, objectIdParam, a
   return res.json({ invoices: invoices.map(cleanInvoice) });
 });
 
+app.get("/api/clients", authRequired, async (req, res) => {
+  const query = req.user.role === "admin" ? {} : { ownerId: new ObjectId(req.user.id) };
+  const clients = await db.collection("clients").find(query).sort({ name: 1 }).toArray();
+  return res.json({ clients: clients.map(cleanClient) });
+});
+
+app.post("/api/clients", authRequired, async (req, res) => {
+  const {
+    name,
+    email = "",
+    contact = "",
+    phone = "",
+    mobile = "",
+    fax = "",
+    website = "",
+    address = "",
+    country = "Senegal",
+    street = "",
+    apartment = "",
+    postalCode = "",
+    city = "",
+    state = "",
+    businessId = "",
+    legalId = "",
+    taxId = "",
+    note = ""
+  } = req.body || {};
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return res.status(400).json({ error: "Nom du client obligatoire" });
+
+  const now = new Date();
+  const clientDoc = {
+    name: cleanName,
+    email: String(email || "").trim(),
+    contact: String(contact || "").trim(),
+    phone: String(phone || "").trim(),
+    mobile: String(mobile || "").trim(),
+    fax: String(fax || "").trim(),
+    website: String(website || "").trim(),
+    address: String(address || "").trim(),
+    country: String(country || "").trim(),
+    street: String(street || "").trim(),
+    apartment: String(apartment || "").trim(),
+    postalCode: String(postalCode || "").trim(),
+    city: String(city || "").trim(),
+    state: String(state || "").trim(),
+    businessId: String(businessId || "").trim(),
+    legalId: String(legalId || "").trim(),
+    taxId: String(taxId || "").trim(),
+    note: String(note || "").trim(),
+    ownerId: new ObjectId(req.user.id),
+    createdAt: now,
+    updatedAt: now
+  };
+  const result = await db.collection("clients").insertOne(clientDoc);
+  return res.status(201).json({ client: cleanClient({ ...clientDoc, _id: result.insertedId }) });
+});
+
+app.put("/api/clients/:id", authRequired, objectIdParam, async (req, res) => {
+  const _id = new ObjectId(req.params.id);
+  const query = req.user.role === "admin" ? { _id } : { _id, ownerId: new ObjectId(req.user.id) };
+  const allowedFields = [
+    "name",
+    "email",
+    "contact",
+    "phone",
+    "mobile",
+    "fax",
+    "website",
+    "address",
+    "country",
+    "street",
+    "apartment",
+    "postalCode",
+    "city",
+    "state",
+    "businessId",
+    "legalId",
+    "taxId",
+    "note"
+  ];
+  const patch = { updatedAt: new Date() };
+  for (const field of allowedFields) {
+    if (field in (req.body || {})) {
+      patch[field] = String(req.body[field] || "").trim();
+    }
+  }
+  if (!patch.name) return res.status(400).json({ error: "Nom du client obligatoire" });
+
+  const result = await db.collection("clients").findOneAndUpdate(
+    query,
+    { $set: patch },
+    { returnDocument: "after" }
+  );
+  if (!result) return res.status(404).json({ error: "Client introuvable" });
+  return res.json({ client: cleanClient(result) });
+});
+
+app.delete("/api/clients/:id", authRequired, objectIdParam, async (req, res) => {
+  const _id = new ObjectId(req.params.id);
+  const query = req.user.role === "admin" ? { _id } : { _id, ownerId: new ObjectId(req.user.id) };
+  const result = await db.collection("clients").deleteOne(query);
+  if (!result.deletedCount) return res.status(404).json({ error: "Client introuvable" });
+  return res.json({ ok: true });
+});
+
 app.get("/api/invoices", authRequired, async (req, res) => {
   const query = req.user.role === "admin" ? {} : { ownerId: new ObjectId(req.user.id) };
   const invoices = await db.collection("invoices").find(query).sort({ updatedAt: -1 }).toArray();
@@ -233,8 +408,14 @@ app.get("/api/invoices", authRequired, async (req, res) => {
 
 app.post("/api/invoices", authRequired, async (req, res) => {
   const now = new Date();
+  const number = await nextInvoiceNumber();
+  const duplicate = await db.collection("invoices").findOne({ number });
+  if (duplicate) {
+    return res.status(409).json({ error: "Numero de facture deja utilise, veuillez reessayer" });
+  }
   const invoice = {
     ...req.body,
+    number,
     ownerId: new ObjectId(req.user.id),
     totalSnapshot: Number(req.body?.totalSnapshot || 0),
     createdAt: now,
@@ -253,6 +434,7 @@ app.put("/api/invoices/:id", authRequired, async (req, res) => {
   delete patch.id;
   delete patch._id;
   delete patch.ownerId;
+  delete patch.number;
   const result = await db.collection("invoices").findOneAndUpdate(query, { $set: patch }, { returnDocument: "after" });
   if (!result) return res.status(404).json({ error: "Facture introuvable" });
   return res.json({ invoice: cleanInvoice(result) });
